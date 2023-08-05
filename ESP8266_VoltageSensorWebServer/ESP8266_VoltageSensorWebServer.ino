@@ -1,3 +1,21 @@
+//=======================================================================
+// ESP8266_VoltageSensorWebServer
+//
+// This script provides a minimal web server for monitoring 4 voltages
+// read by an ADS1115 analog to digital converter. It uses WiFiManager
+// to allow the device to set up its own Access Point that can be used
+// to configure it to connect to the local WiFi.
+//
+// This includes a calibration feature where multiple data points may
+// be gathered and then automatically fit to a quadratic function via
+// regression method. The calibration is stored in non-volatile memory
+// so persists through power cycles.
+//
+// This code is maintained at:
+//
+//  https://github.com/faustus123/WiFiSolarVoltage
+//=======================================================================
+
 
 
 #include <WiFiManager.h>
@@ -10,6 +28,7 @@
 
 // These are used to allow user to press button to manually
 // enter WiFi configuration mode and set up an AP.
+// n.b. The manual switch was never fully implemented!
 #define WIFI_CONFIG_PIN D4
 #define WIFI_CONFIG_LED_PIN D3
 int timeout = 120; // seconds to run for
@@ -318,6 +337,36 @@ String GetSubstring( const String str, const String &str_start, const String &st
 }
 
 //----------------------------------------------
+// HomePageHTML
+//----------------------------------------------
+String HomePageHTML(int &Npar, String *keys, String *vals)
+{
+  String html;
+
+  html += F("<center><h2>Overview</h2></center>\r\n");
+  html += F("<center><p style=\"width:900px;\">"
+            "This device uses an ADS1115 quad-channel "
+            "analog to digital converter to measure voltages and make them available on-demand "
+            "via WiFi. The objective is to allow remote monitoring of a small solar power "
+            "project. The 4 channels can be connected to either side of a pair of shunt resistors "
+            "to monitor two different currents. This setup assumes channels A0 and A1 monitor one shunt while "
+            "channels A2 and A3 monitor another. The shunts are assumed to be 50A 75mV."
+            "</p></center>\r\n");
+            
+  html += F("<center><p style=\"width:900px;\">"
+            "The ADS1115 device is limited to measuring 3.3V max so a pair of resistors is used "
+            "for each channel to step it down by about a factor of 11. This means this device is "
+            "able to measure voltages from 0 up to about 36V. The precision seems to be about "
+            "1mV. The resistors for each channel will have small differences so calibration is "
+            "necessary. There is a calibration feature that allows data to "
+            "be entered and appropriate calibration constants derived which are then stored in "
+            "non-volatile memory. Please see the calibration page for more details. "
+             "</p></center>\r\n");
+
+  return html;
+}
+
+//----------------------------------------------
 // MonitorPageHTML
 //----------------------------------------------
 String MonitorPageHTML(int &Npar, String *keys, String *vals)
@@ -571,10 +620,12 @@ String prepareHtmlPage(const String &line)
     htmlPage += StatusJSON();
   }else{
     htmlPage += HeaderHTML(refresh_period);
-  
+
     if(page_type.startsWith("monitor.html"  )) htmlPage += MonitorPageHTML(Npar, keys, vals);
-    if(page_type.startsWith("calibrate.html")) htmlPage += CalibratePageHTML(Npar, keys, vals);
-  
+    else if(page_type.startsWith("calibrate.html")) htmlPage += CalibratePageHTML(Npar, keys, vals);
+    else htmlPage += HomePageHTML(Npar, keys, vals);
+
+    htmlPage += F("<hr><i>This code maintained at: <A href=\"https://github.com/faustus123/WiFiSolarVoltageMonitor\">https://github.com/faustus123/WiFiSolarVoltageMonitor</A></i>\r\n");
     htmlPage += F("</html>\r\n");
   }
 
