@@ -100,6 +100,7 @@ void setup()
   ADS.begin(D2, D1);
   if( ADS.isConnected() ) {
     Serial.println("Connected to ADS1115 ADC");
+    ADS.setGain(2); // set max voltage of +/- 2.048V. With ~11 reduction factor, this allows us to measure up to ~+/-22V
   }else{
     Serial.println("ERROR Connecting to ADS1115 ADC!!!");
   }
@@ -127,6 +128,10 @@ void ReadAllValues(float* values)
     for(int i=0; i<4; i++) values[i] = -99.0;
     return;
   }
+
+  // NOTE: It is tempting to use the differential voltage reading functions
+  // provided by the ADS library here. We can't do that though because we
+  // need to use our calibrated values which the ADS library doesn't know about.
 
   // Average 10 readings for each channel.
   // n.b. inner/outer loop order is on purpose to try and get
@@ -305,11 +310,22 @@ String StatusJSON(void)
   float I2_3 = (calibrated_values[2] - calibrated_values[3]) * 50.0/0.075; // shunt resistor is 50A 75mV
   json += F("\"I0_1\" : \"") + String(I0_1, PRECISION) + F("\",\n");
   json += F("\"I2_3\" : \"") + String(I2_3, PRECISION) + F("\",\n");
-  json += F("\"date\" : \"") + currentDate + F("\"\n");
 
+  float Watts1_0 = -I0_1*(calibrated_values[0] + calibrated_values[1])/2.0; // Watts coming FROM solar charger
+  float Watts2_3 =  I2_3*(calibrated_values[2] + calibrated_values[3])/2.0; // Watts going TO inverter
+  json += F("\"Watts1_0\" : \"") + String(Watts1_0, PRECISION) + F("\",\n");
+  json += F("\"Watts2_3\" : \"") + String(Watts2_3, PRECISION) + F("\",\n");
+  
+  json += F("\"date\" : \"") + currentDate + F("\"\n");
   json += F("}\n");
 
-  return json;
+  // Need to send proper response header first for JSON
+  String response = F("HTTP/1.1 200 OK\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Content-Length: ") + String( json.length() ) + F("\r\n\r\n");
+  response += json;
+
+  return response;
 }
 
 //----------------------------------------------
@@ -404,13 +420,18 @@ String MonitorPageHTML(int &Npar, String *keys, String *vals)
   float I2_3 = (calibrated_values[2] - calibrated_values[3]) * 50.0/0.075; // shunt resistor is 50A 75mV
   html += F("<p>Current from A0 to A1: ") + String(I0_1,PRECISION) + F("A</p>\r\n");
   html += F("<p>Current from A2 to A3: ") + String(I2_3,PRECISION) + F("A</p>\r\n");
-  
+
+  float Watts1_0 = -I0_1*(calibrated_values[0] + calibrated_values[1])/2.0; // Watts coming FROM solar charger
+  float Watts2_3 =  I2_3*(calibrated_values[2] + calibrated_values[3])/2.0; // Watts going TO inverter
+  html += F("<p>Watts from  Solar: ") + String(Watts1_0,PRECISION) + F("W</p>\r\n");
+  html += F("<p>Watts to Inverter: ") + String(Watts2_3,PRECISION) + F("W</p>\r\n");
+
   html += F("<p>Time read: ");
   html += timeClient.getFormattedTime();
   html += F("</p><hr>\r\n");
 
   // Calibration constants
-  html += F("Calibration constants:<br\r\n");
+  html += F("Calibration constants:<br>\r\n");
   for( int i=0; i<4; i++ ){
     html += F("V") + String(i) + F(": ") + String(A[i], PRECISION) + F("*v^2 + ") + String(B[i], PRECISION) + F("*v + ") + String(C[i], PRECISION) + F("<br>\r\n");
   }
@@ -459,13 +480,16 @@ String CalibratePageHTML(int &Npar, String *keys, String *vals)
   String html;
   html += F("<center><h2>Calibration Tool</h2></center>\r\n");
   html += F("<center><p style=\"width:900px;\">To calibrate, connect all four ADC probes to the same voltage source "
-            "(and the ground wire to the ground). Set the voltage to several values with a "
-            "focus on the range from 10V to 20V. At each setting, enter the actual voltage "
+            "(and the ground wire to the ground). Set the voltage to several values but include "
+            "a small voltage (<2V), some in the middle (~12V) and a large one (~20V). It is observed that having"
+            "the long lever arm of small and large voltages gives calibrations with much more consistent readings."
+            "At each voltage setting, enter the actual voltage "
             "and  hit \"enter\" or click the \"add point\" button. The more points, the better. "
             "If you enter a wrong voltage, you'll need to hit the \"clear\" button and start over. "
             "Once you have entered several points, hit the \"finish\" button to fit the data and "
             "store the calibration. You can add more points after clicking \"finish\" as long as "
-            "the window is still up. All of the data points shown on the bottom will be used. "
+            "the window is still up. Just hit \"finish\" again when you want to save the calibration."
+            "All of the data points shown on the bottom will be used. "
             "</p></center>\r\n");
 
   // Add form for inputing new voltage. Includes hidden values to
