@@ -2,7 +2,7 @@
 A ESP8266 NodeMCU based IoT to monitor voltage and current of solar power system via WiFi.
 
 
-## Recording to Time-series InfluxDB Database
+## Setting up InfluxDB Time-series  Database
 
 This mostly follows the instructions given here:
 [https://hub.docker.com/_/influxdb](https://hub.docker.com/_/influxdb)
@@ -38,25 +38,28 @@ docker exec influxdb2 influx setup \
     --force
 ~~~
 
-Create a token for accessing the DB
+Create a token for accessing the DB. The "token" part of this needs to be copied into the `WiFiSolarVoltageMonitor.py` script.
 ~~~bash
 docker exec influxdb2 influx auth create --org $ORGANIZATION --all-access
 ~~~
 
-Add a "Bucket" (i.e database) with a 100year retention policy.
+Add a "Bucket" (i.e database) with a 100year retention policy. The default retention policy is 30days, but we don't ever need to delete this data.
 ~~~bash
 export BUCKET=HL_Solar
 docker exec influxdb2 influx bucket create -n $BUCKET -o $ORGANIZATION -r 5200w
 ~~~
 
+## Running the `WiFiSolarVoltageMonitor.py` script
+This script needs to be edited to update the `vmon_url` and the `db_token` at the very least. Once this is done, it can be started with no arguments. It should print a reading every 10 seconds when it makes a new DB entry. 
+(Place in a crontab to autimatically start on reboot if desired.)
 
-### Setting up Grafana server
 
-Create directory to hold grafana configs and fire up server
-~~~bash
-mkdir -p $HOME/HomeSolar/grafana
-docker run -d -p 3000:3000 --name=grafana --rm \
-  -v ${HOME}/HomeSolar/grafana:/var/lib/grafana \
-  grafana/grafana-enterprise
-~~~
+## Setting up a dashboard.
 
+The InfluxDB instance has a built-in dashboard that looks a lot like Grafana (and
+may even *be* Grafana under the hood). Just point a web browser to the `8086` port on the host running the server. For example:
+
+[http://localhost:8086]()
+
+Use the username/password specified above to log in and create a dashboard. Assuming the device has entered at least one data point, you should be able
+to see the fields and construct the dashboard.
