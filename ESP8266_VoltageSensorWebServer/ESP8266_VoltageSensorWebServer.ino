@@ -6,10 +6,20 @@
 // to allow the device to set up its own Access Point that can be used
 // to configure it to connect to the local WiFi.
 //
+// This assumes a wiring configuration where A0 uses a resistor chain
+// to scale down the voltage so the battery voltage may be measured.
+// GND is on the battery negative.
+// A1 is on the other side of a shunt from GND connecting to inverter.
+// A2 and A3 are on either side of shunt connecting to GND of solar
+// charger. 
+//
 // This includes a calibration feature where multiple data points may
 // be gathered and then automatically fit to a quadratic function via
 // regression method. The calibration is stored in non-volatile memory
-// so persists through power cycles.
+// so persists through power cycles. Only A0 uses the calibration.
+//
+// This firmware includes an OTA updater (port 8266) that can be used 
+// to update the firmware over WiFi.
 //
 // This code is maintained at:
 //
@@ -22,9 +32,11 @@
 #include <NTPClient.h>
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
-#include <ADS1X15.h>
+#include <ADS1X15.h>   // https://github.com/RobTillaart/ADS1X15
 #include <Wire.h>
 #include <EEPROM.h>
+#include <ArduinoOTA.h>
+
 
 // These are used to allow user to press button to manually
 // enter WiFi configuration mode and set up an AP.
@@ -43,6 +55,7 @@ const int MAX_CALIB_VALUES = 32;
 
 // Calibration constants. These are automatically ovwritten if
 // constants are found in the EEPROM.
+bool CALIB_ENABLED[4] = {true, false, false, false};
 float A[4] = {0.0, 0.0, 0.0, 0.0};
 float B[4] = {11.0, 11.0, 11.0, 11.0};
 float C[4] = {0.0, 0.0 ,0.0, 0.0};
@@ -56,7 +69,7 @@ WiFiServer server(80);
 
 // For getting and keeping current time (see https://github.com/arduino-libraries/NTPClient)
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", -4*60*60, 60*60*1000); // -4*60*60 is for adjusting to EST timezone. Only update once/hr)
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60*60*1000); // 0 is for adjusting timezone (0=UTC). Only update once/hr)
 
 // ADC (4 channel)
 ADS1115 ADS(0x48);
@@ -65,6 +78,17 @@ unsigned long html_page_requests = 0;
 
 void ReadCalibration( );
 
+struct SingleReading{
+  float vA0;
+  float vA1;
+  float vA2;
+  float vA3;
+
+  float v2_3;
+  float I2_3;
+  float I1_GND;
+};
+
 
 //----------------------------------------------
 // setup
@@ -72,7 +96,7 @@ void ReadCalibration( );
 void setup()
 {
   // Start serial monitor
-  Serial.begin(115200);
+  Serial.begin(74880); // the ESP8266 boot loader uses this. We can set it to something else here, but the first few messages will be garbled.
   Serial.println();
 
   // Connect to WiFi
@@ -96,11 +120,56 @@ void setup()
   timeClient.begin();
   timeClient.update(); // n.b. this does not block and is not required to succeed
 
+  //...............................................................................
+  // Setup to allow Over The Air (OTA) updates to the firmware. This allows the
+  // program to updated via WiFi without having to connect via USB.
+  // NOTE: To use this, select the approriate IP address for the serial port in
+  // the Arduino IDE. This will allow uploading the new firmware but
+  // IT WILL NOT ALLOW SERIAL MONITORING OVER THE WiFi!!!
+
+  // Set password for firmware updates
+  ArduinoOTA.setPassword("314159");
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else {  // U_FS
+      type = "filesystem";
+    }
+
+    // NOTE: if updating FS this would be the place to unmount FS using FS.end()
+    Serial.println("Start updating " + type);
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Auth Failed");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Begin Failed");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Connect Failed");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Receive Failed");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("End Failed");
+    }
+  });
+  ArduinoOTA.begin();
+  //...............................................................................
+
   // Check communication with ADS1115 ADC
   ADS.begin(D2, D1);
   if( ADS.isConnected() ) {
     Serial.println("Connected to ADS1115 ADC");
     ADS.setGain(2); // set max voltage of +/- 2.048V. With ~11 reduction factor, this allows us to measure up to ~+/-22V
+                    // n.b. gain=0 +/- 6.144V   gain=1 +/-4.096V   gain=2 +/- 2.048V  gain=4  +/-1.024V   gain=8  +/-0.512V  gain=16 +/-0.256V
   }else{
     Serial.println("ERROR Connecting to ADS1115 ADC!!!");
   }
@@ -117,37 +186,40 @@ void setup()
 // ReadAllValues
 //
 // This will read all each of the 4 ADC channels
-// 10 times and average the readings.
+// 10 times and average the readings. It will also
+// do the same for the voltage difference between
+// A2 and A3.
 //----------------------------------------------
 void ReadAllValues(float* values)
 {
-
+  // values[0] to values[3] are channels 0-4
+  // values[4] is the difference between A2 and A3
+ 
   // If we somehow were unable to connect to the ADS1115
   // then just return all values of -99.
   if( !ADS.isConnected() ){
-    for(int i=0; i<4; i++) values[i] = -99.0;
+    for(int i=0; i<5; i++) values[i] = -99.0;
     return;
   }
-
-  // NOTE: It is tempting to use the differential voltage reading functions
-  // provided by the ADS library here. We can't do that though because we
-  // need to use our calibrated values which the ADS library doesn't know about.
 
   // Average 10 readings for each channel.
   // n.b. inner/outer loop order is on purpose to try and get
   // better average rather than re-use same reading multiple times.
   int Nreads = 10;
-  float v_sum[4] = {0.0, 0.0, 0.0, 0.0};
+  float v_sum[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
   for( int j=0; j<Nreads; j++ ){
     for(int i=0; i<4; i++){
       int16_t adc = ADS.readADC(i);
       float v = ADS.toVoltage( adc );
       v_sum[i] += v;
     }
-  }
+
+    int16_t adc = ADS.readADC_Differential_2_3();
+    v_sum[4] += ADS.toVoltage( adc );
+ }
 
   // Divide by number of reads to get average
-  for(int i=0; i<4; i++){
+  for(int i=0; i<5; i++){
      values[i] = v_sum[i] / (float)Nreads;
   }
 }
@@ -257,9 +329,24 @@ void ReadCalibration( )
 //----------------------------------------------
 // ApplyCalibration
 //
-// Apply calibration values to convert from the
-// voltage measured by ADS1115 (which has been
-// scaled by resistor chain) into actual voltage.
+// Convert from measured values into actual values.
+//
+// Channel A0 is scaled by a resistor chain so needs
+// calibration constants applied to scale up to voltage.
+//
+// Channels A1-A3 are just copied since they trust the
+// ADS1115 internal circuitry.
+//
+// Upon entry values[4] will contain the voltage difference
+// between A2 and A3 as read by a special call of the ADS115
+// library. These should be reading across a shunt resistor
+// The shunt parameters are used to calculate Amps which is
+// written into calculated_values[4].
+//
+// Another shunt resistor is between A1 and GND so those
+// parameters are used to convert A1 into Amps which is
+// written into calculated_values[5].
+// 
 // Upon entry "values" should contain the uncalibrated
 // values obtained from a call to ReadAllValues().
 // If a non-NULL pointer is passed for "calibrated_values"
@@ -270,15 +357,31 @@ void ReadCalibration( )
 //
 // The values in A[], B[], C[] will have already been
 // read from EEPROM via ReadCalibration().
+//
+// NOTE: If calibrated_values is not NULL, it should point to 
+// an array of at least 6 elements. If it is NULL, then values
+// should point to an array of at least 6 elements!
 //----------------------------------------------
 void ApplyCalibration(float* values, float *calibrated_values=NULL)
 {
   if( calibrated_values==NULL ) calibrated_values = values;
 
+  // Voltages
   for(int i=0; i<4; i++){
     float v = values[i];
-    calibrated_values[i] = C[i] + B[i]*v + A[i]*v*v;
-  } 
+    if( CALIB_ENABLED[i] ){
+      calibrated_values[i] = C[i] + B[i]*v + A[i]*v*v;
+    }else{
+      calibrated_values[i] = v;
+    }
+  }
+
+  // Currents
+  float I2_3 = values[4] * 100.0/0.075; // shunt resistor is 100A 75mV. A2 measures battery side of shunt while A3 measures solar charger side.
+  float I1 = calibrated_values[1] * 200.0/0.075; // shunt resistor is 200A 75mV. A1 measures inverter side GND while ADS1115 device GND is battery side of shunt
+
+  calibrated_values[4] = I2_3;
+  calibrated_values[5] = I1;
 }
 
 //----------------------------------------------
@@ -286,14 +389,14 @@ void ApplyCalibration(float* values, float *calibrated_values=NULL)
 //----------------------------------------------
 String StatusJSON(void)
 {
-  float values[4];
+  float values[5]; // 5th value is difference between A2 and A3
   ReadAllValues(values);
 
-  float calibrated_values[4];
+  float calibrated_values[6];
   ApplyCalibration(values, calibrated_values);
 
   String formattedTime = timeClient.getFormattedTime();
-  time_t epochTime = timeClient.getEpochTime();
+  time_t epochTime = timeClient.getEpochTime(); // n.b. this is UTC time and the zone we want to report in the JSON record
   struct tm *ptm = gmtime ((time_t *)&epochTime); 
   int monthDay = ptm->tm_mday;
   int currentMonth = ptm->tm_mon+1;
@@ -306,15 +409,15 @@ String StatusJSON(void)
      json += F("\"V") + String(i) +  F("\" : \"") + String(calibrated_values[i], PRECISION) +  F("\",\n");
   }
 
-  float I0_1 = (calibrated_values[0] - calibrated_values[1]) * 50.0/0.075; // shunt resistor is 50A 75mV
-  float I2_3 = (calibrated_values[2] - calibrated_values[3]) * 50.0/0.075; // shunt resistor is 50A 75mV
-  json += F("\"I0_1\" : \"") + String(I0_1, PRECISION) + F("\",\n");
+  float I2_3 = calibrated_values[4];
+  float I1 = calibrated_values[5];
+  json += F("\"I1\" : \"") + String(I1, PRECISION) + F("\",\n");
   json += F("\"I2_3\" : \"") + String(I2_3, PRECISION) + F("\",\n");
 
-  float Watts1_0 = -I0_1*(calibrated_values[0] + calibrated_values[1])/2.0; // Watts coming FROM solar charger
-  float Watts2_3 =  I2_3*(calibrated_values[2] + calibrated_values[3])/2.0; // Watts going TO inverter
-  json += F("\"Watts1_0\" : \"") + String(Watts1_0, PRECISION) + F("\",\n");
-  json += F("\"Watts2_3\" : \"") + String(Watts2_3, PRECISION) + F("\",\n");
+  float P1 = I1*calibrated_values[0]; // Watts going TO inverter
+  float P2_3 =  I2_3*calibrated_values[0]; // Watts coming FROM solar charger
+  json += F("\"P1\" : \"") + String(P1, PRECISION) + F("\",\n");
+  json += F("\"P2_3\" : \"") + String(P2_3, PRECISION) + F("\",\n");
   
   json += F("\"date\" : \"") + currentDate + F("\"\n");
   json += F("}\n");
@@ -387,11 +490,21 @@ String HomePageHTML(int &Npar, String *keys, String *vals)
 //----------------------------------------------
 String MonitorPageHTML(int &Npar, String *keys, String *vals)
 {
-  float values[4];
+  float values[5];
   ReadAllValues(values);
 
-  float calibrated_values[4];
+  float calibrated_values[6];
   ApplyCalibration(values, calibrated_values);
+
+  time_t epochTime = timeClient.getEpochTime() - 4*60*60; // n.b. the -4*60*60 converts to EST time for web page display
+  struct tm *ptm = gmtime ((time_t *)&epochTime); 
+  int monthDay = ptm->tm_mday;
+  int currentMonth = ptm->tm_mon+1;
+  int currentYear = ptm->tm_year+1900;
+  int currentHour = ptm->tm_hour;
+  int currentMin = ptm->tm_min;
+  int currentSec = ptm->tm_sec;
+  String currentDate = String(currentYear) + "-" + String(currentMonth) + "-" + String(monthDay) + " " + String(currentHour) + ":" + String(currentMin) + ":" + String(currentSec);
 
   String html;
   html.reserve(1024);               // prevent ram fragmentation
@@ -416,18 +529,27 @@ String MonitorPageHTML(int &Npar, String *keys, String *vals)
   }
   html += F("</table>\r\n");
 
-  float I0_1 = (calibrated_values[0] - calibrated_values[1]) * 50.0/0.075; // shunt resistor is 50A 75mV
-  float I2_3 = (calibrated_values[2] - calibrated_values[3]) * 50.0/0.075; // shunt resistor is 50A 75mV
-  html += F("<p>Current from A0 to A1: ") + String(I0_1,PRECISION) + F("A</p>\r\n");
-  html += F("<p>Current from A2 to A3: ") + String(I2_3,PRECISION) + F("A</p>\r\n");
+  html += F("<table border=\"1\" bgcolor=\"black\">");
+  html += F("<tr style=\"background-color:silver\"><th></th><th>Vdiff</th><th>current</th><th>power</th>\r\n");
 
-  float Watts1_0 = -I0_1*(calibrated_values[0] + calibrated_values[1])/2.0; // Watts coming FROM solar charger
-  float Watts2_3 =  I2_3*(calibrated_values[2] + calibrated_values[3])/2.0; // Watts going TO inverter
-  html += F("<p>Watts from  Solar: ") + String(Watts1_0,PRECISION) + F("W</p>\r\n");
-  html += F("<p>Watts to Inverter: ") + String(Watts2_3,PRECISION) + F("W</p>\r\n");
+  float I2_3 = calibrated_values[4];
+  float I1 = calibrated_values[5];
+  float P2_3 = I2_3*calibrated_values[0];
+  float P1 = I1*calibrated_values[0];
+  html += "<tr><td style=\"color:#5F5\">FROM Solar</td>\r\n";
+  html += "<td style=\"color:orange\">" + String(values[4]*1000.0, 1) + "mV</td>\r\n";
+  html += "<td style=\"color:orange\">" + String(I2_3, 2) + "A</td>\r\n";
+  html += "<td style=\"color:orange\">"+ String(P2_3, 2) + "W</td></tr>\r\n";
+
+  html += "<tr><td style=\"color:#5F5\">TO Inverter</td>\r\n";
+  html += "<td style=\"color:orange\">" + String(calibrated_values[1]*1000.0, 1) + "mV</td>\r\n";
+  html += "<td style=\"color:orange\">" + String(I1, 2) + "A</td>\r\n";
+  html += "<td style=\"color:orange\">"+ String(P1, 2) + "W</td></tr>\r\n";
+
+  html += F("</table>\r\n");
 
   html += F("<p>Time read: ");
-  html += timeClient.getFormattedTime();
+  html += currentDate;
   html += F("</p><hr>\r\n");
 
   // Calibration constants
@@ -463,7 +585,7 @@ String CalibratePageHTML(int &Npar, String *keys, String *vals)
       if( idx>=Nvals ) Nvals = idx+1;  // This is really not a safe way to do this!
     }
     if( keys[i] == "voltage" ){
-      float values[4];
+      float values[5];
       ReadAllValues(new_values);
       new_voltage = vals[i].toFloat();
     }
@@ -661,6 +783,7 @@ String prepareHtmlPage(const String &line)
 //----------------------------------------------
 void loop()
 {
+  ArduinoOTA.handle(); // allows firmware upgrade over WiFi
   timeClient.update();
   
   WiFiClient client = server.accept();
