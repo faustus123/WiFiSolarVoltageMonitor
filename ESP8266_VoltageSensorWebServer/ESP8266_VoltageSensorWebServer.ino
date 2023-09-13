@@ -1,25 +1,36 @@
 //=======================================================================
 // ESP8266_VoltageSensorWebServer
 //
-// This script provides a minimal web server for monitoring 4 voltages
-// read by an ADS1115 analog to digital converter. It uses WiFiManager
-// to allow the device to set up its own Access Point that can be used
-// to configure it to connect to the local WiFi.
+// This sketch is the firmware on the HL WiFiSolarVoltageMonitor.
+// The device consists of 2 ADS1115 ADC units and one BME280
+// Temperature, humidity, and atmospheric pressure device. The
+// First ADS1115 is used to read two currents via shunt resistors
+// and the second is used to read 4 absolute voltages up to ~22V.
 //
-// This assumes a wiring configuration where A0 uses a resistor chain
-// to scale down the voltage so the battery voltage may be measured.
-// GND is on the battery negative.
-// A1 is on the other side of a shunt from GND connecting to inverter.
-// A2 and A3 are on either side of shunt connecting to GND of solar
-// charger. 
+// This provides a minimal web server for monitoring the sensors via
+// web browser. When initially powered, it will try and connect to
+// WiFi network using saved credentials. If that fails, it will create
+// its own access point called "DLVoltageMonitor" that can be used 
+// to enter the credentials of the WiFi system which it will then save.
 //
-// This includes a calibration feature where multiple data points may
-// be gathered and then automatically fit to a quadratic function via
-// regression method. The calibration is stored in non-volatile memory
-// so persists through power cycles. Only A0 uses the calibration.
+// Once connected to the local WiFi network, the web server can be used
+// for both monitoring the sensors via web browser (using standard port
+// 80) and downloading the latest values via JSON file.
 //
-// This firmware includes an OTA updater (port 8266) that can be used 
-// to update the firmware over WiFi.
+// This assumes a wiring configuration where "A0-A1" read the voltage
+// across a 100A 75mV shunt resistor (connect this to solar charger).
+// The "A2-A3" are assumed connected across a 200A 75mV shunt resistor
+// (connect this to inverter).
+//
+// The individual voltage sensors are labeled A0, A1, A2, A3 and are each
+// scaled down by about a factor of ~11 using a resistor chain. Because the
+// resistors have limited precision, a calibration feature is included
+// to allow each of them to be calibrated. The calibration constants
+// are stored in NV memory so it only needs to be done once. This is done
+// via web browser so see that page for more details.
+//
+// This firmware includes an OTA (Over-The_Air) updater (port 8266) that
+// can be used to update the firmware over WiFi.
 //
 // This code is maintained at:
 //
@@ -34,16 +45,14 @@
 #include <WiFiUdp.h>
 #include <ADS1X15.h>   // https://github.com/RobTillaart/ADS1X15
 #include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <DHT.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
+#include <map>
 
-
-// These are used to allow user to press button to manually
-// enter WiFi configuration mode and set up an AP.
-// n.b. The manual switch was never fully implemented!
-#define WIFI_CONFIG_PIN D4
-#define WIFI_CONFIG_LED_PIN D3
-int timeout = 120; // seconds to run for
+// Name of Access Point (AP) to create when unable to connect to local WiFi
 const char *APNAME = "DLVoltageMonitor";
 
 // This specifies the number of digits to use when converting to
@@ -53,9 +62,13 @@ int PRECISION = 5;
 // Used to size arrays for holding calibration values
 const int MAX_CALIB_VALUES = 32;
 
+// Map channel names to alternatives for JSON records
+// (this is filled at end of setup())
+std::map<String, String> NAMES_MAP;
+
 // Calibration constants. These are automatically ovwritten if
 // constants are found in the EEPROM.
-bool CALIB_ENABLED[4] = {true, false, false, false};
+bool CALIB_ENABLED[4] = {true, true, true, true};
 float A[4] = {0.0, 0.0, 0.0, 0.0};
 float B[4] = {11.0, 11.0, 11.0, 11.0};
 float C[4] = {0.0, 0.0 ,0.0, 0.0};
@@ -72,21 +85,40 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60*60*1000); // 0 is for adjusting timezone (0=UTC). Only update once/hr)
 
 // ADC (4 channel)
-ADS1115 ADS(0x48);
+ADS1115 ADSI(0x49);  // Used for monitoring current
+ADS1115 ADSV(0x48);  // Used for monitoring voltage
+
+// BME280 Temp, humidity, and Pressure sensor
+Adafruit_BME280 bme280;
+bool bme280active = false;
+
+// DHT11 Temp, humidity sensor (n.b. when looking at sensor with pins point down, wire left to right as signal, Vcc, GND)
+#define DHTPIN 2   // GPIO2 = D4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+bool dht11active = false;
 
 unsigned long html_page_requests = 0;
 
 void ReadCalibration( );
 
 struct SingleReading{
+  float vA0_A1;
+  float vA2_A3;
+  float IA0_A1;
+  float IA2_A3;
+  
   float vA0;
   float vA1;
   float vA2;
   float vA3;
 
-  float v2_3;
-  float I2_3;
-  float I1_GND;
+  float temp;
+  float humidity;
+  float atm_pressure;
+
+  float dht_temp;
+  float dht_humidity;
 };
 
 
@@ -122,7 +154,7 @@ void setup()
 
   //...............................................................................
   // Setup to allow Over The Air (OTA) updates to the firmware. This allows the
-  // program to updated via WiFi without having to connect via USB.
+  // program to be updated via WiFi without having to connect via USB.
   // NOTE: To use this, select the approriate IP address for the serial port in
   // the Arduino IDE. This will allow uploading the new firmware but
   // IT WILL NOT ALLOW SERIAL MONITORING OVER THE WiFi!!!
@@ -165,18 +197,47 @@ void setup()
   //...............................................................................
 
   // Check communication with ADS1115 ADC
-  ADS.begin(D2, D1);
-  if( ADS.isConnected() ) {
-    Serial.println("Connected to ADS1115 ADC");
-    ADS.setGain(2); // set max voltage of +/- 2.048V. With ~11 reduction factor, this allows us to measure up to ~+/-22V
+  ADSI.begin(D2, D1);
+  if( ADSI.isConnected() ) {
+    Serial.println("Connected to ADS1115 ADC (0x49)");
+    ADSI.setGain(8); // set max voltage of +/- 512mV. In principle, the voltage difference should not go above ~75mV
                     // n.b. gain=0 +/- 6.144V   gain=1 +/-4.096V   gain=2 +/- 2.048V  gain=4  +/-1.024V   gain=8  +/-0.512V  gain=16 +/-0.256V
   }else{
-    Serial.println("ERROR Connecting to ADS1115 ADC!!!");
+    Serial.println("ERROR Connecting to ADS1115 ADC (0x49)!!!");
   }
+
+  ADSV.begin(D2, D1);
+  if( ADSV.isConnected() ) {
+    Serial.println("Connected to ADS1115 ADC (0x48)");
+    ADSV.setGain(2); // set max voltage of +/- 2.048V. With ~11 reduction factor, this allows us to measure up to ~+/-22V
+                    // n.b. gain=0 +/- 6.144V   gain=1 +/-4.096V   gain=2 +/- 2.048V  gain=4  +/-1.024V   gain=8  +/-0.512V  gain=16 +/-0.256V
+  }else{
+    Serial.println("ERROR Connecting to ADS1115 ADC (0x48)!!!");
+  }
+
+  // BME280 Temp, humidity, pressure sensor
+  bme280active = bme280.begin(0x77);
+  if( !bme280active ){
+    Serial.println("ERROR Connecting to BME280 (0x77)!!!");
+  }
+
+  // DHT11 Temp, humidity sensor
+  dht.begin();
+  dht11active = true;
 
   // Initialize EEPROM for use (this is only for ESP8266 and not all arduinos!)
   EEPROM.begin(EEPROM_SIZE);
   ReadCalibration();
+
+  // Fill names map so values can be translated into something more useful for JSON records
+  NAMES_MAP["vA0"] = "v_battery"; 
+  NAMES_MAP["vA1"] = "vA1"; 
+  NAMES_MAP["vA2"] = "vA2"; 
+  NAMES_MAP["vA3"] = "vA3"; 
+  NAMES_MAP["IA0_A1"] = "i_solar"; 
+  NAMES_MAP["IA2_A3"] = "i_inverter"; 
+  NAMES_MAP["PA0_A1"] = "p_solar"; 
+  NAMES_MAP["PA2_A3"] = "p_inverter"; 
   
   server.begin();
   Serial.printf("Web server started, open %s in a web browser\n", WiFi.localIP().toString().c_str());
@@ -185,43 +246,54 @@ void setup()
 //----------------------------------------------
 // ReadAllValues
 //
-// This will read all each of the 4 ADC channels
-// 10 times and average the readings. It will also
-// do the same for the voltage difference between
-// A2 and A3.
+// This will read all of the sensors and write
+// the values into the provided "vals" structure.
+// Any sensors that are unavailable will have a
+// value of -99.
 //----------------------------------------------
-void ReadAllValues(float* values)
+void ReadAllValues(SingleReading* vals)
 {
-  // values[0] to values[3] are channels 0-4
-  // values[4] is the difference between A2 and A3
- 
-  // If we somehow were unable to connect to the ADS1115
-  // then just return all values of -99.
-  if( !ADS.isConnected() ){
-    for(int i=0; i<5; i++) values[i] = -99.0;
-    return;
+  // Initialize values to defaults in case any can't be read
+  vals->vA0_A1 = vals->vA2_A3 = -99.0;  
+  vals->IA0_A1 = vals->IA2_A3 = -99.0;  
+  vals->vA0 = vals->vA1 = vals->vA2 = vals->vA3 = -99.0;
+  vals->temp = vals->humidity = vals->atm_pressure = -99.0;
+  vals->dht_temp = vals->dht_humidity = -99.0;
+
+  // Read voltage differences
+  if( ADSI.isConnected() ){
+    int16_t adc01 = ADSI.readADC_Differential_0_1();
+    int16_t adc23 = ADSI.readADC_Differential_2_3();
+    vals->vA0_A1 = ADSI.toVoltage( adc01 ); // shunt resistor is 100A/75mV
+    vals->vA2_A3 = ADSI.toVoltage( adc23 ); // shunt resistor is 200A/75mV
   }
 
-  // Average 10 readings for each channel.
-  // n.b. inner/outer loop order is on purpose to try and get
-  // better average rather than re-use same reading multiple times.
-  int Nreads = 10;
-  float v_sum[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
-  for( int j=0; j<Nreads; j++ ){
-    for(int i=0; i<4; i++){
-      int16_t adc = ADS.readADC(i);
-      float v = ADS.toVoltage( adc );
-      v_sum[i] += v;
-    }
-
-    int16_t adc = ADS.readADC_Differential_2_3();
-    v_sum[4] += ADS.toVoltage( adc );
- }
-
-  // Divide by number of reads to get average
-  for(int i=0; i<5; i++){
-     values[i] = v_sum[i] / (float)Nreads;
+  // Read voltages
+  if( ADSV.isConnected() ){
+    int16_t adc0 = ADSV.readADC(0);
+    int16_t adc1 = ADSV.readADC(1);
+    int16_t adc2 = ADSV.readADC(2);
+    int16_t adc3 = ADSV.readADC(3);
+    vals->vA0 = ADSV.toVoltage( adc0 );
+    vals->vA1 = ADSV.toVoltage( adc1 );
+    vals->vA2 = ADSV.toVoltage( adc2 );
+    vals->vA3 = ADSV.toVoltage( adc3 );
   }
+
+  // Read environment
+  if( bme280active ){
+    vals->temp = 9.0/5.0*bme280.readTemperature() + 32.0; // convert to F
+    vals->humidity = bme280.readHumidity();               // %
+    vals->atm_pressure = bme280.readPressure()/1000.0;    // convert to kPa
+  }
+
+  if( dht11active ){
+    vals->dht_temp = dht.readTemperature(true); // true= Farenheit
+    vals->dht_humidity = dht.readHumidity();
+    if(isnan(vals->dht_temp    )) vals->dht_temp     = -99.0;
+    if(isnan(vals->dht_humidity)) vals->dht_humidity = -99.0;
+  }
+
 }
 
 //----------------------------------------------
@@ -329,59 +401,39 @@ void ReadCalibration( )
 //----------------------------------------------
 // ApplyCalibration
 //
-// Convert from measured values into actual values.
-//
-// Channel A0 is scaled by a resistor chain so needs
-// calibration constants applied to scale up to voltage.
-//
-// Channels A1-A3 are just copied since they trust the
-// ADS1115 internal circuitry.
-//
-// Upon entry values[4] will contain the voltage difference
-// between A2 and A3 as read by a special call of the ADS115
-// library. These should be reading across a shunt resistor
-// The shunt parameters are used to calculate Amps which is
-// written into calculated_values[4].
-//
-// Another shunt resistor is between A1 and GND so those
-// parameters are used to convert A1 into Amps which is
-// written into calculated_values[5].
+// Convert measured values from SingleReading into 
+// calibrated values using current calibration.
 // 
-// Upon entry "values" should contain the uncalibrated
+// Upon entry "vals" should contain the uncalibrated
 // values obtained from a call to ReadAllValues().
-// If a non-NULL pointer is passed for "calibrated_values"
-// then the calibrated values are written there.
-// If no value (or NULL) is passed for "calibrated_values"
-// the the contents of "values" will be overwritten with
-// the calibrated values.
 //
-// The values in A[], B[], C[] will have already been
-// read from EEPROM via ReadCalibration().
+// The calibration constants (e.g.) A[], B[], C[])
+// will have already been read from EEPROM via
+// ReadCalibration().
 //
-// NOTE: If calibrated_values is not NULL, it should point to 
-// an array of at least 6 elements. If it is NULL, then values
-// should point to an array of at least 6 elements!
 //----------------------------------------------
-void ApplyCalibration(float* values, float *calibrated_values=NULL)
+void ApplyCalibration(SingleReading* vals)
 {
-  if( calibrated_values==NULL ) calibrated_values = values;
+  // Copy values into array
+  float values[4] = {vals->vA0, vals->vA1, vals->vA2, vals->vA3};
 
-  // Voltages
+  // Loop over voltages, calibrating or copying
   for(int i=0; i<4; i++){
     float v = values[i];
     if( CALIB_ENABLED[i] ){
-      calibrated_values[i] = C[i] + B[i]*v + A[i]*v*v;
-    }else{
-      calibrated_values[i] = v;
+      values[i] = C[i] + B[i]*v + A[i]*v*v;
     }
   }
 
-  // Currents
-  float I2_3 = values[4] * 100.0/0.075; // shunt resistor is 100A 75mV. A2 measures battery side of shunt while A3 measures solar charger side.
-  float I1 = calibrated_values[1] * 200.0/0.075; // shunt resistor is 200A 75mV. A1 measures inverter side GND while ADS1115 device GND is battery side of shunt
+  // Copy calibrated values back into "vals"
+  if(vals->vA0 != -99.0) vals->vA0 = values[0];
+  if(vals->vA1 != -99.0) vals->vA1 = values[1];
+  if(vals->vA2 != -99.0) vals->vA2 = values[2];
+  if(vals->vA3 != -99.0) vals->vA3 = values[3];
 
-  calibrated_values[4] = I2_3;
-  calibrated_values[5] = I1;
+  // Calculate currents from measured voltage differentials
+  if(vals->vA0_A1 != -99.0) vals->IA0_A1 = vals->vA0_A1 * 100.0/0.075; // 100A/75mV shunt
+  if(vals->vA2_A3 != -99.0) vals->IA2_A3 = vals->vA2_A3 * 200.0/0.075; // 200A/75mV shunt
 }
 
 //----------------------------------------------
@@ -389,11 +441,9 @@ void ApplyCalibration(float* values, float *calibrated_values=NULL)
 //----------------------------------------------
 String StatusJSON(void)
 {
-  float values[5]; // 5th value is difference between A2 and A3
-  ReadAllValues(values);
-
-  float calibrated_values[6];
-  ApplyCalibration(values, calibrated_values);
+  SingleReading values; // 5th value is difference between A2 and A3
+  ReadAllValues(&values);
+  ApplyCalibration(&values);
 
   String formattedTime = timeClient.getFormattedTime();
   time_t epochTime = timeClient.getEpochTime(); // n.b. this is UTC time and the zone we want to report in the JSON record
@@ -405,20 +455,27 @@ String StatusJSON(void)
 
   String json;
   json += F("{\n");
-  for(int i=0; i<4; i++){
-     json += F("\"V") + String(i) +  F("\" : \"") + String(calibrated_values[i], PRECISION) +  F("\",\n");
-  }
+  json += "\"" + NAMES_MAP["vA0"] + "\" : \"" + String(values.vA0, PRECISION) + "\",\n";
+  json += "\"" + NAMES_MAP["vA1"] + "\" : \"" + String(values.vA1, PRECISION) + "\",\n";
+  json += "\"" + NAMES_MAP["vA2"] + "\" : \"" + String(values.vA2, PRECISION) + "\",\n";
+  json += "\"" + NAMES_MAP["vA3"] + "\" : \"" + String(values.vA3, PRECISION) + "\",\n";
 
-  float I2_3 = calibrated_values[4];
-  float I1 = calibrated_values[5];
-  json += F("\"I1\" : \"") + String(I1, PRECISION) + F("\",\n");
-  json += F("\"I2_3\" : \"") + String(I2_3, PRECISION) + F("\",\n");
+  json += "\"" + NAMES_MAP["IA0_A1"] + "\" : \"" + String(values.IA0_A1, PRECISION) + "\",\n";
+  json += "\"" + NAMES_MAP["IA2_A3"] + "\" : \"" + String(values.IA2_A3, PRECISION) + "\",\n";
 
-  float P1 = I1*calibrated_values[0]; // Watts going TO inverter
-  float P2_3 =  I2_3*calibrated_values[0]; // Watts coming FROM solar charger
-  json += F("\"P1\" : \"") + String(P1, PRECISION) + F("\",\n");
-  json += F("\"P2_3\" : \"") + String(P2_3, PRECISION) + F("\",\n");
-  
+  float PA0_A1 = values.IA0_A1 * values.vA0; // Watts coming FROM solar charger
+  float PA2_A3 = values.IA2_A3 * values.vA0; // Watts going TO inverter
+  if( values.IA0_A1==-99.0 || values.vA0==-99.0) PA0_A1 = -99.0;
+  if( values.IA2_A3==-99.0 || values.vA0==-99.0) PA2_A3 = -99.0;
+  json += "\"" + NAMES_MAP["PA0_A1"] + "\" : \"" + String(PA0_A1, PRECISION) + "\",\n";
+  json += "\"" + NAMES_MAP["PA2_A3"] + "\" : \"" + String(PA2_A3, PRECISION) + "\",\n";
+
+  if( values.temp         != -99.0 ) json += "\"temp\" : \""         + String(values.temp,         PRECISION) + "\",\n";
+  if( values.humidity     != -99.0 ) json += "\"humidity\" : \""     + String(values.humidity,     PRECISION) + "\",\n";
+  if( values.atm_pressure != -99.0 ) json += "\"atm_pressure\" : \"" + String(values.atm_pressure, PRECISION) + "\",\n";
+  if( values.dht_temp     != -99.0 ) json += "\"dht_temp\" : \""     + String(values.dht_temp,     PRECISION) + "\",\n";
+  if( values.dht_humidity != -99.0 ) json += "\"dht_humidity\" : \"" + String(values.dht_humidity, PRECISION) + "\",\n";
+
   json += F("\"date\" : \"") + currentDate + F("\"\n");
   json += F("}\n");
 
@@ -464,23 +521,29 @@ String HomePageHTML(int &Npar, String *keys, String *vals)
 
   html += F("<center><h2>Overview</h2></center>\r\n");
   html += F("<center><p style=\"width:900px;\">"
-            "This device uses an ADS1115 quad-channel "
-            "analog to digital converter to measure voltages and make them available on-demand "
+            "This device uses two ADS1115 quad-channel analog to digital converters to measure "
+            "voltages and currents and makes them available on-demand "
             "via WiFi. The objective is to allow remote monitoring of a small solar power "
-            "project. The 4 channels can be connected to either side of a pair of shunt resistors "
-            "to monitor two different currents. This setup assumes channels A0 and A1 monitor one shunt while "
-            "channels A2 and A3 monitor another. The shunts are assumed to be 50A 75mV."
+            "project. Four of the channels are assumed to be connected to either side of a pair of "
+            "shunt resistors (A0_A1 to a 100A/75mV shunt and A2_A3 to a 200A/75mV shunt). "
             "</p></center>\r\n");
             
   html += F("<center><p style=\"width:900px;\">"
-            "The ADS1115 device is limited to measuring 3.3V max so a pair of resistors is used "
-            "for each channel to step it down by about a factor of 11. This means this device is "
-            "able to measure voltages from 0 up to about 36V. The precision seems to be about "
+            "The other 4 channels: A0, A1, A2, A3 "
+            "can be used to measure individual voltages up to ~22V. "
+            "The precision seems to be about "
             "1mV. The resistors for each channel will have small differences so calibration is "
             "necessary. There is a calibration feature that allows data to "
             "be entered and appropriate calibration constants derived which are then stored in "
             "non-volatile memory. Please see the calibration page for more details. "
              "</p></center>\r\n");
+
+  html += F("<center><p style=\"width:900px;\">"
+            "Proper setup connects the A0_A1 pair to the solar charger shunt while the A2_A3 "
+            "pair are connected to the inverter shunt. The A0 channel should be connected to the "
+            "positive battery terminal. The other channels (A1, A2, A3) are read, but not assigned "
+            "specific functions. "
+            "</p></center>\r\n");
 
   return html;
 }
@@ -488,13 +551,17 @@ String HomePageHTML(int &Npar, String *keys, String *vals)
 //----------------------------------------------
 // MonitorPageHTML
 //----------------------------------------------
-String MonitorPageHTML(int &Npar, String *keys, String *vals)
+String MonitorPageHTML(void)
 {
-  float values[5];
-  ReadAllValues(values);
+  // Read values and get calibrated values in different struct so we can show both
+  SingleReading vals;
+  ReadAllValues(&vals);
+  SingleReading calibrated_vals = vals;
+  ApplyCalibration(&calibrated_vals);
 
-  float calibrated_values[6];
-  ApplyCalibration(values, calibrated_values);
+  // Copy into arrays
+  float values[4] = {vals.vA0, vals.vA1, vals.vA2, vals.vA3};
+  float calibrated_values[4] = {calibrated_vals.vA0, calibrated_vals.vA1, calibrated_vals.vA2, calibrated_vals.vA3};
 
   time_t epochTime = timeClient.getEpochTime() - 4*60*60; // n.b. the -4*60*60 converts to EST time for web page display
   struct tm *ptm = gmtime ((time_t *)&epochTime); 
@@ -514,7 +581,8 @@ String MonitorPageHTML(int &Npar, String *keys, String *vals)
   html += F("\">http:\\\\");
   html +=  WiFi.localIP().toString().c_str();
   html += F("</A>\r\n");
-               
+  
+  // Voltages
   html += F("<table border=\"1\" bgcolor=\"black\">");
   html += F("<tr style=\"background-color:gold\"><th>chan</th><th>raw</th><th>calibrated</th>\r\n");
   for( int i=0; i<4; i++ ){
@@ -529,25 +597,48 @@ String MonitorPageHTML(int &Npar, String *keys, String *vals)
   }
   html += F("</table>\r\n");
 
+  // Currents/Power
   html += F("<table border=\"1\" bgcolor=\"black\">");
   html += F("<tr style=\"background-color:silver\"><th></th><th>Vdiff</th><th>current</th><th>power</th>\r\n");
 
-  float I2_3 = calibrated_values[4];
-  float I1 = calibrated_values[5];
-  float P2_3 = I2_3*calibrated_values[0];
-  float P1 = I1*calibrated_values[0];
+  float P0_1 = calibrated_vals.IA0_A1 * calibrated_vals.vA0;
+  if( calibrated_vals.IA0_A1==-99.0 || calibrated_vals.vA0==-99.0 ) P0_1 = -99.0;
   html += "<tr><td style=\"color:#5F5\">FROM Solar</td>\r\n";
-  html += "<td style=\"color:orange\">" + String(values[4]*1000.0, 1) + "mV</td>\r\n";
-  html += "<td style=\"color:orange\">" + String(I2_3, 2) + "A</td>\r\n";
-  html += "<td style=\"color:orange\">"+ String(P2_3, 2) + "W</td></tr>\r\n";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.vA0_A1*1000.0, 1) + "mV</td>\r\n";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.IA0_A1, 2) + "A</td>\r\n";
+  html += "<td style=\"color:orange\">"+ String(P0_1, 2) + "W</td></tr>\r\n";
 
+  float P2_3 = calibrated_vals.IA2_A3 * calibrated_vals.vA0;
+  if( calibrated_vals.IA2_A3==-99.0 || calibrated_vals.vA0==-99.0 ) P2_3 = -99.0;
   html += "<tr><td style=\"color:#5F5\">TO Inverter</td>\r\n";
-  html += "<td style=\"color:orange\">" + String(calibrated_values[1]*1000.0, 1) + "mV</td>\r\n";
-  html += "<td style=\"color:orange\">" + String(I1, 2) + "A</td>\r\n";
-  html += "<td style=\"color:orange\">"+ String(P1, 2) + "W</td></tr>\r\n";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.vA2_A3*1000.0, 1) + "mV</td>\r\n";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.IA2_A3, 2) + "A</td>\r\n";
+  html += "<td style=\"color:orange\">"+ String(P2_3, 2) + "W</td></tr>\r\n";
 
   html += F("</table>\r\n");
 
+  // Environment
+  html += F("<table border=\"1\" bgcolor=\"black\">");
+  html += F("<tr style=\"background-color:aqua\"><th>what</th><th>value</th>\r\n");
+
+  html += "<tr><td style=\"color:orange\">temperature(BME280)</td>";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.temp, 2) + " F</td></tr>\r\n";
+
+  html += "<tr><td style=\"color:orange\">humidity(BME280)</td>";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.humidity, 2) + " %</td></tr>\r\n";
+
+  html += "<tr><td style=\"color:orange\">atmospheric pressure(BME280)</td>";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.atm_pressure, 5) + " kPa</td></tr>\r\n";
+
+  html += "<tr><td style=\"color:orange\">temperature(DHT11)</td>";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.dht_temp, 2) + " F</td></tr>\r\n";
+
+  html += "<tr><td style=\"color:orange\">humidity(DHT11)</td>";
+  html += "<td style=\"color:orange\">" + String(calibrated_vals.dht_humidity, 2) + " %</td></tr>\r\n";
+
+  html += F("</table>\r\n");
+
+  // Time read
   html += F("<p>Time read: ");
   html += currentDate;
   html += F("</p><hr>\r\n");
@@ -555,7 +646,11 @@ String MonitorPageHTML(int &Npar, String *keys, String *vals)
   // Calibration constants
   html += F("Calibration constants:<br>\r\n");
   for( int i=0; i<4; i++ ){
-    html += F("V") + String(i) + F(": ") + String(A[i], PRECISION) + F("*v^2 + ") + String(B[i], PRECISION) + F("*v + ") + String(C[i], PRECISION) + F("<br>\r\n");
+    if( CALIB_ENABLED[i] ){
+      html += F("V") + String(i) + F(": ") + String(A[i], PRECISION) + F("*v^2 + ") + String(B[i], PRECISION) + F("*v + ") + String(C[i], PRECISION) + F("<br>\r\n");
+    }else{
+      html += F("V") + String(i) + F(": v<br>\r\n");
+    }
   }
 
   return html;
@@ -585,8 +680,12 @@ String CalibratePageHTML(int &Npar, String *keys, String *vals)
       if( idx>=Nvals ) Nvals = idx+1;  // This is really not a safe way to do this!
     }
     if( keys[i] == "voltage" ){
-      float values[5];
-      ReadAllValues(new_values);
+      SingleReading values;
+      ReadAllValues(&values);
+      new_values[0] = values.vA0;
+      new_values[1] = values.vA1;
+      new_values[2] = values.vA2;
+      new_values[3] = values.vA3;
       new_voltage = vals[i].toFloat();
     }
   }
@@ -603,14 +702,14 @@ String CalibratePageHTML(int &Npar, String *keys, String *vals)
   html += F("<center><h2>Calibration Tool</h2></center>\r\n");
   html += F("<center><p style=\"width:900px;\">To calibrate, connect all four ADC probes to the same voltage source "
             "(and the ground wire to the ground). Set the voltage to several values but include "
-            "a small voltage (<2V), some in the middle (~12V) and a large one (~20V). It is observed that having"
-            "the long lever arm of small and large voltages gives calibrations with much more consistent readings."
+            "a small voltage (<2V), some in the middle (~12V) and a large one (~20V). It is observed that having "
+            "the long lever arm of small and large voltages gives calibrations with much more consistent readings. "
             "At each voltage setting, enter the actual voltage "
-            "and  hit \"enter\" or click the \"add point\" button. The more points, the better. "
+            "and  hit \"enter\" or click the \"add point\" button. The more points, the better (up to 32). "
             "If you enter a wrong voltage, you'll need to hit the \"clear\" button and start over. "
             "Once you have entered several points, hit the \"finish\" button to fit the data and "
             "store the calibration. You can add more points after clicking \"finish\" as long as "
-            "the window is still up. Just hit \"finish\" again when you want to save the calibration."
+            "the window is still up. Just hit \"finish\" again when you want to save the calibration. "
             "All of the data points shown on the bottom will be used. "
             "</p></center>\r\n");
 
@@ -698,11 +797,12 @@ String HeaderHTML(int refresh_period=0)
   // Title
   html += F("<title>Hill-Lawrence Solar Voltage Monitor</title>\r\n"
             "<center><H1>Hill-Lawrence Solar Voltage Monitor</H1></center>\r\n"
-            "<center><p style=\"width:800px;\">This device will measure the 4 voltages connected to the solar power "
-            "system at my house and make them available via WiFi. They are connected "
-            "to either end of 2 shunt resistors so the current can be obtained as well. "
+            "<center><p style=\"width:800px;\">This device will measure the 8 voltages connected to the solar power "
+            "system at my house and make them available via WiFi. Four are connected "
+            "to either end of 2 shunt resistors to measure the current while a 5th is connected to the battery. "
             "The device uses some non-precise resistors so a calibration feature has been "
-            "added (click the calibration link below)</p></center>\r\n");
+            "added (click the calibration link below). Environmental data is also read via BME280 device. "
+            "</p></center>\r\n");
 
   // Menu bar
   html += F("<center><table><tr>\r\n"
@@ -767,7 +867,7 @@ String prepareHtmlPage(const String &line)
   }else{
     htmlPage += HeaderHTML(refresh_period);
 
-    if(page_type.startsWith("monitor.html"  )) htmlPage += MonitorPageHTML(Npar, keys, vals);
+    if(page_type.startsWith("monitor.html"  )) htmlPage += MonitorPageHTML();
     else if(page_type.startsWith("calibrate.html")) htmlPage += CalibratePageHTML(Npar, keys, vals);
     else htmlPage += HomePageHTML(Npar, keys, vals);
 
