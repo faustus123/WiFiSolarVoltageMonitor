@@ -2,7 +2,7 @@
 // ESP8266_VoltageSensorWebServer
 //
 // This sketch is the firmware on the HL WiFiSolarVoltageMonitor.
-// The device consists of 2 ADS1115 ADC units and one BME280
+// The device consists of 2 ADS1115 ADC units and one bmp280
 // Temperature, humidity, and atmospheric pressure device. The
 // First ADS1115 is used to read two currents via shunt resistors
 // and the second is used to read 4 absolute voltages up to ~22V.
@@ -46,10 +46,12 @@
 #include <ADS1X15.h>   // https://github.com/RobTillaart/ADS1X15
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
-#include <Adafruit_BME280.h>
+#include <Adafruit_BMP280.h>
 #include <DHT.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <map>
 
 // Name of Access Point (AP) to create when unable to connect to local WiFi
@@ -88,15 +90,29 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60*60*1000); // 0 is for adjusti
 ADS1115 ADSI(0x49);  // Used for monitoring current
 ADS1115 ADSV(0x48);  // Used for monitoring voltage
 
-// BME280 Temp, humidity, and Pressure sensor
-Adafruit_BME280 bme280;
-bool bme280active = false;
+// BMP280 Temp, and Pressure sensor
+Adafruit_BMP280 bmp280;
+bool bmp280active = false;
 
 // DHT11 Temp, humidity sensor (n.b. when looking at sensor with pins point down, wire left to right as signal, Vcc, GND)
-#define DHTPIN 2   // GPIO2 = D4
+#define DHTPIN 0   // GPIO2 = D4  GPIO0 = D3
 #define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
 bool dht11active = false;
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+
+// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
+#define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+bool oledactive = false;
+
+// Button state
+#define BUTTON_PIN 12
+unsigned long last_button_dn_time = millis();
+unsigned long last_button_up_time = millis();
+int last_button_state = HIGH;
 
 unsigned long html_page_requests = 0;
 
@@ -130,6 +146,21 @@ void setup()
   // Start serial monitor
   Serial.begin(74880); // the ESP8266 boot loader uses this. We can set it to something else here, but the first few messages will be garbled.
   Serial.println();
+
+  // Set GPIO12=D6 to input (this is the button)
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Lower I2C clock speed for more reliability
+  // Wire.setClock(10000);
+
+   // Initialize OLED 128x64 pixel display
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("SSD1306 allocation failed"));
+  }else{
+    Serial.println(F("SSD1306 found"));
+    oledactive = true;
+    display.display();
+  }
 
   // Connect to WiFi
   // This will use cached credentials to try and connect. If unsuccessful,
@@ -215,10 +246,20 @@ void setup()
     Serial.println("ERROR Connecting to ADS1115 ADC (0x48)!!!");
   }
 
-  // BME280 Temp, humidity, pressure sensor
-  bme280active = bme280.begin(0x77);
-  if( !bme280active ){
-    Serial.println("ERROR Connecting to BME280 (0x77)!!!");
+  // BMP280 Temp, pressure sensor
+  // bmp280active = bmp280.begin(0x76);
+  if( !bmp280active ){
+    Serial.println("ERROR Connecting to bmp280 (0x76)!!!");
+  }
+  if (!bmp280active) {
+    Serial.println(F("Could not find a valid BMP280 sensor, check wiring or "
+                      "try a different address!"));
+    Serial.print("SensorID was: 0x"); Serial.println(bmp280.sensorID(),16);
+    Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
+    Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
+    Serial.print("        ID of 0x60 represents a BME 280.\n");
+    Serial.print("        ID of 0x61 represents a BME 680.\n");
+    // while (1) delay(10);
   }
 
   // DHT11 Temp, humidity sensor
@@ -231,9 +272,9 @@ void setup()
 
   // Fill names map so values can be translated into something more useful for JSON records
   NAMES_MAP["vA0"] = "v_battery"; 
-  NAMES_MAP["vA1"] = "vA1"; 
-  NAMES_MAP["vA2"] = "vA2"; 
-  NAMES_MAP["vA3"] = "vA3"; 
+  NAMES_MAP["vA1"] = "v_GND_battery"; 
+  NAMES_MAP["vA2"] = "v_GND_solar"; 
+  NAMES_MAP["vA3"] = "v_inverter"; 
   NAMES_MAP["IA0_A1"] = "i_solar"; 
   NAMES_MAP["IA2_A3"] = "i_inverter"; 
   NAMES_MAP["PA0_A1"] = "p_solar"; 
@@ -260,36 +301,46 @@ void ReadAllValues(SingleReading* vals)
   vals->temp = vals->humidity = vals->atm_pressure = -99.0;
   vals->dht_temp = vals->dht_humidity = -99.0;
 
+  // Read ADC's multiple times and average values
+  int Nreads = 10;
+
   // Read voltage differences
   if( ADSI.isConnected() ){
-    int16_t adc01 = ADSI.readADC_Differential_0_1();
-    int16_t adc23 = ADSI.readADC_Differential_2_3();
-    vals->vA0_A1 = ADSI.toVoltage( adc01 ); // shunt resistor is 100A/75mV
-    vals->vA2_A3 = ADSI.toVoltage( adc23 ); // shunt resistor is 200A/75mV
+    vals->vA0_A1 = vals->vA2_A3 = 0.0;
+    for(int i=0; i<Nreads; i++){
+      int16_t adc01 = ADSI.readADC_Differential_0_1();
+      int16_t adc23 = ADSI.readADC_Differential_2_3();
+      vals->vA0_A1 += ADSI.toVoltage( adc01 ) / float(Nreads);
+      vals->vA2_A3 += ADSI.toVoltage( adc23 ) / float(Nreads);
+    }
   }
 
   // Read voltages
   if( ADSV.isConnected() ){
-    int16_t adc0 = ADSV.readADC(0);
-    int16_t adc1 = ADSV.readADC(1);
-    int16_t adc2 = ADSV.readADC(2);
-    int16_t adc3 = ADSV.readADC(3);
-    vals->vA0 = ADSV.toVoltage( adc0 );
-    vals->vA1 = ADSV.toVoltage( adc1 );
-    vals->vA2 = ADSV.toVoltage( adc2 );
-    vals->vA3 = ADSV.toVoltage( adc3 );
+    vals->vA0 = vals->vA1 = vals->vA2 = vals->vA3 = 0.0;
+    for(int i=0; i<Nreads; i++){
+      int16_t adc0 = ADSV.readADC(0);
+      int16_t adc1 = ADSV.readADC(1);
+      int16_t adc2 = ADSV.readADC(2);
+      int16_t adc3 = ADSV.readADC(3);
+      vals->vA0 += ADSV.toVoltage( adc0 ) / float(Nreads);
+      vals->vA1 += ADSV.toVoltage( adc1 ) / float(Nreads);
+      vals->vA2 += ADSV.toVoltage( adc2 ) / float(Nreads);
+      vals->vA3 += ADSV.toVoltage( adc3 ) / float(Nreads);
+    }
   }
 
   // Read environment
-  if( bme280active ){
-    vals->temp = 9.0/5.0*bme280.readTemperature() + 32.0; // convert to F
-    vals->humidity = bme280.readHumidity();               // %
-    vals->atm_pressure = bme280.readPressure()/1000.0;    // convert to kPa
+  if( bmp280active ){
+    vals->temp = 9.0/5.0*bmp280.readTemperature() + 32.0; // convert to F
+    // vals->humidity = bmp280.readHumidity();               // %
+    vals->atm_pressure = bmp280.readPressure()/1000.0;    // convert to kPa
   }
 
   if( dht11active ){
     vals->dht_temp = dht.readTemperature(true); // true= Farenheit
     vals->dht_humidity = dht.readHumidity();
+    // Serial.print("vals->dht_temp: "); Serial.println(vals->dht_temp);
     if(isnan(vals->dht_temp    )) vals->dht_temp     = -99.0;
     if(isnan(vals->dht_humidity)) vals->dht_humidity = -99.0;
   }
@@ -432,7 +483,7 @@ void ApplyCalibration(SingleReading* vals)
   if(vals->vA3 != -99.0) vals->vA3 = values[3];
 
   // Calculate currents from measured voltage differentials
-  if(vals->vA0_A1 != -99.0) vals->IA0_A1 = vals->vA0_A1 * 100.0/0.075; // 100A/75mV shunt
+  if(vals->vA0_A1 != -99.0) vals->IA0_A1 = -vals->vA0_A1 * 100.0/0.075; // 100A/75mV shunt
   if(vals->vA2_A3 != -99.0) vals->IA2_A3 = vals->vA2_A3 * 200.0/0.075; // 200A/75mV shunt
 }
 
@@ -621,13 +672,13 @@ String MonitorPageHTML(void)
   html += F("<table border=\"1\" bgcolor=\"black\">");
   html += F("<tr style=\"background-color:aqua\"><th>what</th><th>value</th>\r\n");
 
-  html += "<tr><td style=\"color:orange\">temperature(BME280)</td>";
+  html += "<tr><td style=\"color:orange\">temperature(bmp280)</td>";
   html += "<td style=\"color:orange\">" + String(calibrated_vals.temp, 2) + " F</td></tr>\r\n";
 
-  html += "<tr><td style=\"color:orange\">humidity(BME280)</td>";
+  html += "<tr><td style=\"color:orange\">humidity(bmp280)</td>";
   html += "<td style=\"color:orange\">" + String(calibrated_vals.humidity, 2) + " %</td></tr>\r\n";
 
-  html += "<tr><td style=\"color:orange\">atmospheric pressure(BME280)</td>";
+  html += "<tr><td style=\"color:orange\">atmospheric pressure(bmp280)</td>";
   html += "<td style=\"color:orange\">" + String(calibrated_vals.atm_pressure, 5) + " kPa</td></tr>\r\n";
 
   html += "<tr><td style=\"color:orange\">temperature(DHT11)</td>";
@@ -801,7 +852,7 @@ String HeaderHTML(int refresh_period=0)
             "system at my house and make them available via WiFi. Four are connected "
             "to either end of 2 shunt resistors to measure the current while a 5th is connected to the battery. "
             "The device uses some non-precise resistors so a calibration feature has been "
-            "added (click the calibration link below). Environmental data is also read via BME280 device. "
+            "added (click the calibration link below). Environmental data is also read via bmp280 device. "
             "</p></center>\r\n");
 
   // Menu bar
@@ -879,13 +930,115 @@ String prepareHtmlPage(const String &line)
 }
 
 //----------------------------------------------
+// HandleButton
+//
+// Check if button was pressed or released and respond accordingly
+//----------------------------------------------
+void HandleButton(void)
+{
+  int button_state = digitalRead(BUTTON_PIN);
+  // Serial.print("button state: "); Serial.println(button_state);
+  if( button_state != last_button_state){
+    if( button_state == HIGH ){
+      last_button_up_time = millis();
+    }else{
+      last_button_dn_time = millis();
+    }
+    last_button_state = button_state;
+  }
+}
+
+//----------------------------------------------
+// HandleDisplay
+//
+// Update display
+//----------------------------------------------
+void HandleDisplay(void)
+{
+  if (! oledactive ) return;
+
+  display.clearDisplay();
+  unsigned int tdiff_up = millis() - last_button_up_time;
+  bool draw_display = (last_button_state==LOW || tdiff_up<4000);
+
+
+  // Serial.println("tdiff_up: " + String(tdiff_up) + "  clear_display: " + String(clear_display) );
+ 
+  if( draw_display ){
+    display.setTextColor(WHITE);
+    display.setTextSize(0);
+
+    int y = 0;
+    display.setCursor(0,y);
+    String ipstr = String("IP: ") + WiFi.localIP().toString();
+    display.print(ipstr);
+
+    SingleReading vals;
+    ReadAllValues(&vals);
+    ApplyCalibration(&vals);
+    y += 10;
+    display.setCursor(0,y);
+    String vstr = String("   Battery: " + String(vals.vA0, 2) + String("V"));
+    display.print(vstr);
+
+    y += 10;
+    display.setCursor(0,y);
+    String istr = String("Iin/Iout: " + String(vals.IA0_A1, 1) + String("A/") + String(vals.IA2_A3, 1) + String("A"));
+    display.print(istr);
+
+    // y += 10;
+    // display.setCursor(0,y);
+    // String istr1 = String("   Isolar: " + String(vals.IA0_A1, 1) + String("A"));
+    // display.print(istr1);
+
+    // y += 10;
+    // display.setCursor(0,y);
+    // String istr2 = String(" Iinverter: " + String(vals.IA2_A3, 1) + String("A"));
+    // display.print(istr2);
+
+    float temp = vals.temp==-99.0 ? vals.dht_temp:vals.temp;
+    float humidity = vals.humidity==-99.0 ? vals.dht_humidity:vals.humidity;
+
+    if(temp != -99.0){
+      y += 10;
+      display.setCursor(0,y);
+      String tstr = String("      Temp: " + String(temp, 1) + String("F"));
+      display.print(tstr);
+    }
+
+    if(humidity != -99.0 ){
+      y += 10;
+      display.setCursor(0,y);
+      String hstr = String("  Humidity: " + String(humidity, 1) + String("%"));
+      display.print(hstr);
+    }
+
+    if( vals.atm_pressure != -99.0 ){
+      y += 10;
+      display.setCursor(0,y);
+      String pstr = String("Pressure: " + String(vals.atm_pressure, 1) + String("kPa"));
+      display.print(pstr);
+    }
+  }
+
+  display.display();
+}
+
+//----------------------------------------------
 // loop
 //----------------------------------------------
 void loop()
 {
   ArduinoOTA.handle(); // allows firmware upgrade over WiFi
   timeClient.update();
+
+  // Check for button press
+  HandleButton();
+
+  // Update display
+  HandleDisplay();
   
+  // Service Web Server
   WiFiClient client = server.accept();
   // wait for a client (web browser) to connect
   if (client)
