@@ -4,6 +4,11 @@
 #
 # docker run -d -p 8086:8086 --name influxdb2 -v ${HOME}/HomeSolar/etc/influxdb2:/etc/influxdb2 -v ${HOME}/HomeSolar/DB:/var/lib/influxdb2 influxdb:2.7.1
 #
+#
+# Start this with:
+#
+#  source venv/bin/activate.csh
+#  ./WiFiSolarVoltageMonitor.py
 
 import urllib.request, json
 import argparse
@@ -14,8 +19,10 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.domain.write_precision import WritePrecision
 
-vmon_url = "http://192.168.1.81/status.json"
+vmon_url = "http://192.168.1.82/status.json"
+#vmon_url = "http://192.168.1.81/status.json"
 influxdb_host = "http://localhost:8086"
+WRITE_TO_DB = True
 
 host='localhost'
 port=8086
@@ -62,7 +69,7 @@ while True:
 
 		# Write to InfluxDB database
 		point = Point.from_dict(influxdb_dict, WritePrecision.S)
-		write_api.write(bucket=db_bucket, record=point)
+		if WRITE_TO_DB : write_api.write(bucket=db_bucket, record=point)
 	except:
 		print("Error getting data or writing to DB. Skipping data point.")
   
