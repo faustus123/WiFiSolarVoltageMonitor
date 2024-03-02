@@ -19,7 +19,7 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.domain.write_precision import WritePrecision
 
-vmon_url = "http://192.168.1.82/status.json"
+vmon_url = "http://192.168.1.24/status.json"
 #vmon_url = "http://192.168.1.81/status.json"
 influxdb_host = "http://localhost:8086"
 WRITE_TO_DB = True
