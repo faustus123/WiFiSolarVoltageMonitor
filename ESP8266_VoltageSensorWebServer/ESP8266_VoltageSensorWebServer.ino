@@ -2,7 +2,7 @@
 // ESP8266_VoltageSensorWebServer
 //
 // This sketch is the firmware on the HL WiFiSolarVoltageMonitor.
-// The device consists of 2 ADS1115 ADC units and one bmp280
+// The device consists of 2 ADS1115 ADC units and one bme280
 // Temperature, humidity, and atmospheric pressure device. The
 // First ADS1115 is used to read two currents via shunt resistors
 // and the second is used to read 4 absolute voltages up to ~22V.
@@ -46,7 +46,7 @@
 #include <ADS1X15.h>   // https://github.com/RobTillaart/ADS1X15
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
-#include <Adafruit_BMP280.h>
+#include <Adafruit_BME280.h>
 #include <DHT.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
@@ -90,9 +90,9 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60*60*1000); // 0 is for adjusti
 ADS1115 ADSI(0x49);  // Used for monitoring current
 ADS1115 ADSV(0x48);  // Used for monitoring voltage
 
-// BMP280 Temp, and Pressure sensor
-Adafruit_BMP280 bmp280;
-bool bmp280active = false;
+// E280 Temp, and Pressure sensor
+Adafruit_BME280 bme280;
+bool bme280active = false;
 
 // DHT11 Temp, humidity sensor (n.b. when looking at sensor with pins point down, wire left to right as signal, Vcc, GND)
 #define DHTPIN 0   // GPIO2 = D4  GPIO0 = D3
@@ -246,15 +246,13 @@ void setup()
     Serial.println("ERROR Connecting to ADS1115 ADC (0x48)!!!");
   }
 
-  // BMP280 Temp, pressure sensor
-  // bmp280active = bmp280.begin(0x76);
-  if( !bmp280active ){
-    Serial.println("ERROR Connecting to bmp280 (0x76)!!!");
-  }
-  if (!bmp280active) {
-    Serial.println(F("Could not find a valid BMP280 sensor, check wiring or "
+  // BME280 Temp, pressure sensor
+  bme280active = bme280.begin(0x76);
+  if( !bme280active ){
+    Serial.println("ERROR Connecting to bme280 (0x76)!!!");
+    Serial.println(F("Could not find a valid BME280 sensor, check wiring or "
                       "try a different address!"));
-    Serial.print("SensorID was: 0x"); Serial.println(bmp280.sensorID(),16);
+    Serial.print("SensorID was: 0x"); Serial.println(bme280.sensorID(),16);
     Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
     Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
     Serial.print("        ID of 0x60 represents a BME 280.\n");
@@ -263,8 +261,8 @@ void setup()
   }
 
   // DHT11 Temp, humidity sensor
-  dht.begin();
-  dht11active = true;
+  //dht.begin();
+  //dht11active = true;
 
   // Initialize EEPROM for use (this is only for ESP8266 and not all arduinos!)
   EEPROM.begin(EEPROM_SIZE);
@@ -331,10 +329,10 @@ void ReadAllValues(SingleReading* vals)
   }
 
   // Read environment
-  if( bmp280active ){
-    vals->temp = 9.0/5.0*bmp280.readTemperature() + 32.0; // convert to F
-    // vals->humidity = bmp280.readHumidity();               // %
-    vals->atm_pressure = bmp280.readPressure()/1000.0;    // convert to kPa
+  if( bme280active ){
+    vals->temp = 9.0/5.0*bme280.readTemperature() + 32.0; // convert to F
+    vals->humidity = bme280.readHumidity();               // %
+    vals->atm_pressure = bme280.readPressure()/1000.0;    // convert to kPa
   }
 
   if( dht11active ){
@@ -429,6 +427,18 @@ String SaveCalibration( int Nvals, float *volts, float adc[4][MAX_CALIB_VALUES] 
 //----------------------------------------------
 void ReadCalibration( )
 {
+
+  // WARNING: Bypassing the 2nd order calibration values for now and
+  // using measured resistor values
+  double R1[4] = {0.1006, 0.1006, 0.1009, 0.1014};
+  double R2[4] = { 1.002,  1.000,  1.002,  1.006};
+  for( int i=0; i<4; i++ ){
+    B[i] = (R2[i] + R1[i])/R1[i];
+  }
+  Serial.println( "Hardcoded calibration used." );
+  return;
+
+
   // Read all parameters from EEPROM
   Serial.println( "Reading calibration constants from EEPROM ..." );
   int addr=0;
@@ -484,7 +494,7 @@ void ApplyCalibration(SingleReading* vals)
 
   // Calculate currents from measured voltage differentials
   if(vals->vA0_A1 != -99.0) vals->IA0_A1 = -vals->vA0_A1 * 100.0/0.075; // 100A/75mV shunt
-  if(vals->vA2_A3 != -99.0) vals->IA2_A3 = vals->vA2_A3 * 200.0/0.075; // 200A/75mV shunt
+  if(vals->vA2_A3 != -99.0) vals->IA2_A3 = -vals->vA2_A3 * 200.0/0.075; // 200A/75mV shunt
 }
 
 //----------------------------------------------
@@ -672,13 +682,13 @@ String MonitorPageHTML(void)
   html += F("<table border=\"1\" bgcolor=\"black\">");
   html += F("<tr style=\"background-color:aqua\"><th>what</th><th>value</th>\r\n");
 
-  html += "<tr><td style=\"color:orange\">temperature(bmp280)</td>";
+  html += "<tr><td style=\"color:orange\">temperature(bm3280)</td>";
   html += "<td style=\"color:orange\">" + String(calibrated_vals.temp, 2) + " F</td></tr>\r\n";
 
-  html += "<tr><td style=\"color:orange\">humidity(bmp280)</td>";
+  html += "<tr><td style=\"color:orange\">humidity(bm3280)</td>";
   html += "<td style=\"color:orange\">" + String(calibrated_vals.humidity, 2) + " %</td></tr>\r\n";
 
-  html += "<tr><td style=\"color:orange\">atmospheric pressure(bmp280)</td>";
+  html += "<tr><td style=\"color:orange\">atmospheric pressure(bm3280)</td>";
   html += "<td style=\"color:orange\">" + String(calibrated_vals.atm_pressure, 5) + " kPa</td></tr>\r\n";
 
   html += "<tr><td style=\"color:orange\">temperature(DHT11)</td>";
@@ -852,7 +862,7 @@ String HeaderHTML(int refresh_period=0)
             "system at my house and make them available via WiFi. Four are connected "
             "to either end of 2 shunt resistors to measure the current while a 5th is connected to the battery. "
             "The device uses some non-precise resistors so a calibration feature has been "
-            "added (click the calibration link below). Environmental data is also read via bmp280 device. "
+            "added (click the calibration link below). Environmental data is also read via bme280 device. "
             "</p></center>\r\n");
 
   // Menu bar
